@@ -6,10 +6,14 @@ AI助手核心脚本 - by 阮阮
 
 import os
 import time
+import threading
+import tempfile
+import base64
 from datetime import datetime
 from typing import Optional
 import argparse
 import re
+from PIL import Image, ImageGrab
 from rich_utils import (print_error, print_success, print_warning, print_info, print_progress,
                        display_ai_response, display_statistics, create_streaming_callback, rich_output)
 from ai_client import get_client, AIClientError
@@ -139,21 +143,33 @@ class AIHelper:
             print_error("获取AI回答失败")
 
     def _chat_with_stream(self, prompt: str) -> None:
-        """流式模式对话 - Rich增强版"""
-        # rich_output.print_ai_response_start("GLM-4 正在回答中...")
+        """流式模式对话 - Rich增强版，并行优化"""
         
         # 统计变量
-        start_time = time.time()
+        api_start_time = None
+        first_token_time = None
         total_chars = 0
         total_tokens_estimate = 0
         full_response = ""
+        streaming_callback = None
+        
+        # 共享变量，用于线程间通信
+        rich_ready = threading.Event()
+        api_ready = threading.Event()
         
         try:
-            # 创建流式输出回调
-            streaming_callback = create_streaming_callback("AI 回复")
+            def init_rich():
+                """Rich初始化线程"""
+                nonlocal streaming_callback
+                streaming_callback = create_streaming_callback("AI 回复")
+                rich_ready.set()  # 通知Rich初始化完成
             
             def on_chunk(chunk: str):
-                nonlocal total_chars, total_tokens_estimate, full_response
+                nonlocal total_chars, total_tokens_estimate, full_response, first_token_time
+                
+                # 记录首个词的响应时间 (TTFT - Time To First Token)
+                if first_token_time is None and chunk.strip():
+                    first_token_time = time.time()
                 
                 # 累积完整响应
                 full_response += chunk
@@ -166,28 +182,43 @@ class AIHelper:
                 english_chars = len(clean_chunk) - chinese_chars
                 total_tokens_estimate += chinese_chars // 2 + english_chars // 4
                 
-                # 使用Rich流式回调
+                # 等待Rich初始化完成再显示
+                rich_ready.wait()
                 streaming_callback(chunk)
                 time.sleep(self.config.stream_delay)
 
+            # 并行启动：Rich初始化
+            rich_thread = threading.Thread(target=init_rich)
+            rich_thread.start()
+            
+            # 立即发送API请求（不等Rich初始化）
+            api_start_time = time.time()
             result = self.client.chat_with_scenario(prompt, "chat", on_chunk)
             
+            # 等待Rich线程完成
+            rich_thread.join()
+            
             # 完成流式输出
-            streaming_callback.finish()
+            if streaming_callback:
+                streaming_callback.finish()
             
             # 计算统计信息
             end_time = time.time()
-            duration = end_time - start_time
+            duration = end_time - api_start_time if api_start_time else 0
             chars_per_sec = total_chars / duration if duration > 0 else 0
             tokens_per_sec = total_tokens_estimate / duration if duration > 0 else 0
             
+            # 计算首词响应时间 (TTFT)
+            ttft = (first_token_time - api_start_time) if (first_token_time and api_start_time) else 0
+            
             if result:
-                # 显示统计信息
+                # 显示统计信息，包含首词响应时间
                 stats = {
                     "chars": total_chars,
                     "tokens": total_tokens_estimate,
                     "speed": chars_per_sec,
                     "token_speed": tokens_per_sec,
+                    "ttft": ttft,  # Time To First Token
                     "duration": duration
                 }
                 display_statistics(stats)
@@ -334,6 +365,193 @@ description: "关于{title}的技术分享"
             print_error(f"读取文件失败: {e}")
             return ""
 
+    def get_clipboard_image(self) -> Optional[str]:
+        """从剪贴板获取图片并转换为base64"""
+        try:
+            # 尝试从剪贴板获取图片
+            clipboard_image = ImageGrab.grabclipboard()
+            
+            if clipboard_image is None:
+                return None
+            
+            if not isinstance(clipboard_image, Image.Image):
+                return None
+            
+            # 保存到临时文件并转换为base64
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                clipboard_image.save(temp_file.name, 'PNG')
+                temp_path = temp_file.name
+            
+            # 读取并编码为base64
+            with open(temp_path, 'rb') as f:
+                image_data = f.read()
+                base64_image = base64.b64encode(image_data).decode('utf-8')
+            
+            # 删除临时文件
+            os.unlink(temp_path)
+            
+            return base64_image
+            
+        except Exception as e:
+            print_error(f"获取剪贴板图片失败: {e}")
+            return None
+
+    def chat_with_image(self, question: str, custom_prompt: str = None) -> None:
+        """带图片的AI对话"""
+        if not question:
+            print_info("Usage: python ai_helper.py chat --image \"describe this image\"")
+            return
+
+        print_info("🖼️ 正在检测剪贴板图片...")
+        
+        # 获取剪贴板图片
+        base64_image = self.get_clipboard_image()
+        if not base64_image:
+            print_error("剪贴板中没有找到图片！请先截图或复制图片。")
+            return
+        
+        print_success("✅ 已获取剪贴板图片")
+        print_info(f"Question: {question}\n")
+
+        # 使用自定义prompt或默认prompt
+        if custom_prompt:
+            print_info(f"使用自定义 Prompt: {custom_prompt[:50]}{'...' if len(custom_prompt) > 50 else ''}")
+            general_prompt = f"{custom_prompt}\n\n问题：{question}"
+        else:
+            default_prompt = self.get_default_prompt()
+            general_prompt = f"{default_prompt}\n\n问题：{question}"
+
+        # 视觉分析使用流式输出
+        should_use_stream = (
+            self.config.is_streaming_enabled() and 
+            self.config.get_scenario_config("vision").get("stream", True)
+        )
+        
+        if should_use_stream:
+            self._chat_with_vision_stream(general_prompt, base64_image)
+        else:
+            self._chat_with_vision_batch(general_prompt, base64_image)
+    
+    def _chat_with_vision_stream(self, prompt: str, image_base64: str) -> None:
+        """流式模式视觉对话 - Rich增强版"""
+        
+        # 统计变量
+        api_start_time = None
+        first_token_time = None
+        total_chars = 0
+        total_tokens_estimate = 0
+        full_response = ""
+        streaming_callback = None
+        
+        # 共享变量，用于线程间通信
+        rich_ready = threading.Event()
+        
+        try:
+            def init_rich():
+                """Rich初始化线程"""
+                nonlocal streaming_callback
+                streaming_callback = create_streaming_callback("🖼️ 视觉分析")
+                rich_ready.set()  # 通知Rich初始化完成
+            
+            def on_chunk(chunk: str):
+                nonlocal total_chars, total_tokens_estimate, full_response, first_token_time
+                
+                # 记录首个词的响应时间 (TTFT - Time To First Token)
+                if first_token_time is None and chunk.strip():
+                    first_token_time = time.time()
+                
+                # 累积完整响应
+                full_response += chunk
+                
+                # 清理chunk，移除ANSI颜色代码进行统计
+                clean_chunk = re.sub(r'\x1b\[[0-9;]*m', '', chunk)
+                total_chars += len(clean_chunk)
+                # 粗略估算token数（中文约2字符=1token，英文约4字符=1token）
+                chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', clean_chunk))
+                english_chars = len(clean_chunk) - chinese_chars
+                total_tokens_estimate += chinese_chars // 2 + english_chars // 4
+                
+                # 等待Rich初始化完成再显示
+                rich_ready.wait()
+                streaming_callback(chunk)
+                time.sleep(self.config.stream_delay)
+
+            # 并行启动：Rich初始化
+            rich_thread = threading.Thread(target=init_rich)
+            rich_thread.start()
+            
+            # 立即发送API请求（不等Rich初始化）
+            api_start_time = time.time()
+            result = self.client.chat_with_scenario(prompt, "vision", on_chunk, image_base64=image_base64)
+            
+            # 等待Rich线程完成
+            rich_thread.join()
+            
+            # 完成流式输出
+            if streaming_callback:
+                streaming_callback.finish()
+            
+            # 计算统计信息
+            end_time = time.time()
+            duration = end_time - api_start_time if api_start_time else 0
+            chars_per_sec = total_chars / duration if duration > 0 else 0
+            tokens_per_sec = total_tokens_estimate / duration if duration > 0 else 0
+            
+            # 计算首词响应时间 (TTFT)
+            ttft = (first_token_time - api_start_time) if (first_token_time and api_start_time) else 0
+            
+            if result:
+                # 显示统计信息，包含首词响应时间
+                stats = {
+                    "chars": total_chars,
+                    "tokens": total_tokens_estimate,
+                    "speed": chars_per_sec,
+                    "token_speed": tokens_per_sec,
+                    "ttft": ttft,  # Time To First Token
+                    "duration": duration
+                }
+                display_statistics(stats)
+            else:
+                print_error("获取视觉分析失败")
+
+        except AIClientError as e:
+            print_error(f"视觉对话失败: {e}")
+        except Exception as e:
+            print_error(f"未知错误: {e}")
+    
+    def _chat_with_vision_batch(self, prompt: str, image_base64: str) -> None:
+        """批量模式视觉对话 - Rich增强版"""
+        print_info("🖼️ Qwen-VL 正在分析图片...")
+        start_time = time.time()
+        
+        try:
+            result = self.client.chat_with_scenario(prompt, "vision", image_base64=image_base64)
+        except Exception as e:
+            print_error(f"视觉分析失败: {e}")
+            return
+        
+        end_time = time.time()
+        duration = end_time - start_time
+
+        if result:
+            # 使用Rich显示AI回复
+            display_ai_response(result, "🖼️ 视觉分析")
+            
+            # 统计信息
+            total_chars = len(result)
+            chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', result))
+            english_chars = total_chars - chinese_chars
+            total_tokens_estimate = chinese_chars // 2 + english_chars // 4
+            
+            stats = {
+                "chars": total_chars,
+                "tokens": total_tokens_estimate,
+                "duration": duration
+            }
+            display_statistics(stats)
+        else:
+            print_error("获取视觉分析失败")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -361,6 +579,7 @@ def main():
     chat_parser.add_argument('-s', '--stream', action='store_true', help='启用流式输出')
     chat_parser.add_argument('-p', '--prompt', help='自定义 Prompt')
     chat_parser.add_argument('--prompt-file', help='从文件读取自定义 Prompt')
+    chat_parser.add_argument('--image', action='store_true', help='启用图片分析模式（从剪贴板获取图片）')
 
     # generate命令
     gen_parser = subparsers.add_parser('generate', help='生成博客文章')
@@ -397,7 +616,10 @@ def main():
             custom_prompt = ai.read_prompt_from_file(args.prompt_file)
 
         if question:
-            ai.chat(question, use_stream=args.stream, custom_prompt=custom_prompt)
+            if args.image:
+                ai.chat_with_image(question, custom_prompt=custom_prompt)
+            else:
+                ai.chat(question, use_stream=args.stream, custom_prompt=custom_prompt)
         else:
             print_error("未提供有效的问题内容")
 

@@ -51,7 +51,7 @@ class AIConfig:
             # 流式模式配置
             "enable_streaming": True,  # 是否支持流式模式
             "stream_chunk_size": 1,    # 流式输出块大小
-            "stream_delay": 0.02,      # 流式输出延迟（秒）
+            "stream_delay": 0.005,      # 流式输出延迟（秒）
             "show_thinking": True,     # 是否显示思考状态
 
             # 场景特定配置
@@ -77,12 +77,19 @@ class AIConfig:
                     "stream": True,      # 千问支持流式
                     "temperature": 0.7,
                     "max_tokens": 4096,
-                    "show_thinking": True
+                    "show_thinking": False
                 },
                 "vector_query": {
                     "stream": False,     # 向量查询使用批量模式
                     "temperature": 0.5,  # 查询更精确
                     "max_tokens": 2000,
+                    "show_thinking": False
+                },
+                "vision": {
+                    "stream": True,      # 视觉分析使用流式模式
+                    "temperature": 0.7,  # 视觉描述需要一定创造性
+                    "max_tokens": 2000,
+                    "model_name": "Qwen/Qwen2.5-VL-72B-Instruct",  # 视觉模型
                     "show_thinking": False
                 }
             },

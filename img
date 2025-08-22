@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""
+IMG - 智能图像分析命令 - by 阮阮
+从剪贴板获取图片并进行AI分析
+
+用法：
+  img 描述下这张图片
+  img 请分析这个截图的内容和布局
+  img 这是什么？
+"""
+
+import os
+import sys
+import time
+import threading
+import tempfile
+import base64
+import re
+from typing import Optional
+from PIL import Image, ImageGrab
+
+# 添加脚本目录到路径
+sys.path.insert(0, '/Users/leion/scripts')
+
+from rich_utils import (print_error, print_success, print_warning, print_info, print_progress,
+                       display_ai_response, display_statistics, create_streaming_callback, rich_output)
+from ai_client import get_client, AIClientError
+from ai_config import get_config
+
+
+class ImageAnalyzer:
+    """图像分析器"""
+    
+    def __init__(self):
+        self.client = get_client()
+        self.config = get_config()
+        
+    def get_clipboard_image(self) -> Optional[str]:
+        """从剪贴板获取图片并转换为base64"""
+        try:
+            clipboard_image = ImageGrab.grabclipboard()
+            
+            if clipboard_image is None:
+                return None
+            
+            if not isinstance(clipboard_image, Image.Image):
+                return None
+            
+            # 保存到临时文件并转换为base64
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                clipboard_image.save(temp_file.name, 'PNG')
+                temp_path = temp_file.name
+            
+            # 读取并编码为base64
+            with open(temp_path, 'rb') as f:
+                image_data = f.read()
+                base64_image = base64.b64encode(image_data).decode('utf-8')
+            
+            # 删除临时文件
+            os.unlink(temp_path)
+            
+            return base64_image
+            
+        except Exception as e:
+            print_error(f"获取剪贴板图片失败: {e}")
+            return None
+
+    def analyze_image(self, question: str) -> None:
+        """分析剪贴板中的图片"""
+        if not question:
+            print_info("用法: img 描述下这张图片")
+            return
+
+        print_info("🖼️ 正在检测剪贴板图片...")
+        
+        # 获取剪贴板图片
+        base64_image = self.get_clipboard_image()
+        if not base64_image:
+            print_error("❌ 剪贴板中没有找到图片！")
+            print_info("💡 请先截图或复制图片，然后重新运行命令")
+            return
+        
+        print_success("✅ 已获取剪贴板图片")
+        print_info(f"📝 分析需求: {question}")
+
+        # 直接使用用户问题，不添加额外的prompt提示词
+        full_prompt = question
+
+        # 暂时使用批量模式，避免流式显示问题
+        self._analyze_with_batch(full_prompt, base64_image)
+
+    def _analyze_with_stream(self, prompt: str, image_base64: str) -> None:
+        """流式模式图像分析 - 优化版"""
+        
+        # 统计变量
+        api_start_time = None
+        first_token_time = None
+        total_chars = 0
+        total_tokens_estimate = 0
+        streaming_callback = None
+        
+        try:
+            print_info("🤖 Qwen-VL 正在分析图片...")
+            
+            # 预先创建streaming callback
+            streaming_callback = create_streaming_callback("🖼️ 图像分析")
+            
+            def on_chunk(chunk: str):
+                nonlocal total_chars, total_tokens_estimate, first_token_time
+                
+                # 记录首个词的响应时间 (TTFT - Time To First Token)
+                if first_token_time is None and chunk.strip():
+                    first_token_time = time.time()
+                
+                # 清理chunk，移除ANSI颜色代码进行统计
+                clean_chunk = re.sub(r'\x1b\[[0-9;]*m', '', chunk)
+                total_chars += len(clean_chunk)
+                # 粗略估算token数（中文约2字符=1token，英文约4字符=1token）
+                chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', clean_chunk))
+                english_chars = len(clean_chunk) - chinese_chars
+                total_tokens_estimate += chinese_chars // 2 + english_chars // 4
+                
+                # 输出chunk到streaming callback
+                if streaming_callback:
+                    streaming_callback(chunk)
+                    time.sleep(self.config.stream_delay)
+
+            # 发送API请求
+            api_start_time = time.time()
+            result = self.client.chat_with_scenario(prompt, "vision", on_chunk, image_base64=image_base64)
+            
+            # 完成流式输出
+            if streaming_callback:
+                streaming_callback.finish()
+            
+            # 计算统计信息
+            end_time = time.time()
+            duration = end_time - api_start_time if api_start_time else 0
+            chars_per_sec = total_chars / duration if duration > 0 else 0
+            tokens_per_sec = total_tokens_estimate / duration if duration > 0 else 0
+            
+            # 计算首词响应时间 (TTFT)
+            ttft = (first_token_time - api_start_time) if (first_token_time and api_start_time) else 0
+            
+            if result:
+                # 显示统计信息
+                stats = {
+                    "chars": total_chars,
+                    "tokens": total_tokens_estimate,
+                    "speed": chars_per_sec,
+                    "token_speed": tokens_per_sec,
+                    "ttft": ttft,  # Time To First Token
+                    "duration": duration
+                }
+                display_statistics(stats)
+            else:
+                print_error("❌ 图像分析失败")
+
+        except AIClientError as e:
+            if streaming_callback:
+                streaming_callback.finish()
+            print_error(f"❌ 图像分析失败: {e}")
+        except Exception as e:
+            if streaming_callback:
+                streaming_callback.finish()
+            print_error(f"❌ 未知错误: {e}")
+
+    def _analyze_with_batch(self, prompt: str, image_base64: str) -> None:
+        """批量模式图像分析 - 稳定版本"""
+        try:
+            print_info("🤖 Qwen-VL 正在分析图片...")
+            
+            # 使用批量模式获取完整结果
+            api_start_time = time.time()
+            result = self.client.chat_with_scenario(prompt, "vision", image_base64=image_base64)
+            end_time = time.time()
+            
+            if result:
+                # 使用Rich显示AI回复
+                display_ai_response(result, "🖼️ 图像分析")
+                
+                # 计算统计信息
+                duration = end_time - api_start_time
+                total_chars = len(result)
+                chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', result))
+                english_chars = total_chars - chinese_chars
+                total_tokens_estimate = chinese_chars // 2 + english_chars // 4
+                
+                stats = {
+                    "chars": total_chars,
+                    "tokens": total_tokens_estimate,
+                    "duration": duration
+                }
+                display_statistics(stats)
+            else:
+                print_error("❌ 图像分析失败")
+                
+        except AIClientError as e:
+            print_error(f"❌ 图像分析失败: {e}")
+        except Exception as e:
+            print_error(f"❌ 未知错误: {e}")
+
+
+def main():
+    """主函数"""
+    if len(sys.argv) < 2:
+        # 显示帮助信息
+        rich_output.console.print("""
+[bold blue]🖼️ IMG - 智能图像分析命令[/]
+
+[green]用法:[/]
+  img 描述下这张图片
+  img 请分析这个截图的内容和布局  
+  img 这是什么？
+  img 请识别图片中的文字
+
+[yellow]使用步骤:[/]
+  1. 先截图或复制图片到剪贴板 (Cmd+C)
+  2. 运行 img + 你的分析需求
+  
+[cyan]示例:[/]
+  img 这张图片里有什么？
+  img 请分析这个界面的设计特点
+  img 识别图片中的文字内容
+""")
+        return
+
+    # 获取用户问题（合并所有参数）
+    question = " ".join(sys.argv[1:])
+    
+    # 创建分析器并执行分析
+    analyzer = ImageAnalyzer()
+    analyzer.analyze_image(question)
+
+
+if __name__ == "__main__":
+    main()

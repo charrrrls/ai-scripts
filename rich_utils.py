@@ -141,6 +141,8 @@ class RichOutput:
             stat_parts.append(f"{stats['chars']} chars")
         if "speed" in stats:
             stat_parts.append(f"{stats['speed']:.1f} chars/s")
+        if "ttft" in stats:
+            stat_parts.append(f"TTFT {stats['ttft']:.2f}s")
         if "duration" in stats:
             stat_parts.append(f"{stats['duration']:.1f}s")
         
@@ -178,22 +180,51 @@ class RichOutput:
         return False
     
     def create_streaming_callback(self, title: str = "AI 回复"):
-        """创建流式输出回调函数"""
+        """创建流式输出回调函数 - 简化版本，避免重复显示"""
         content = ""
-        live = Live(console=self.console, refresh_per_second=8)
-        live.start()
+        live = None
+        initialized = False
         
         def callback(chunk: str):
-            nonlocal content
+            nonlocal content, live, initialized
             content += chunk
-            panel = self.create_ai_panel(content + "[dim]▊[/]", title)
-            live.update(panel)
+            
+            # 只在首次调用时初始化Live
+            if not initialized:
+                # 清空一行为Live准备空间
+                self.console.print()
+                live = Live(
+                    self.create_ai_panel("[dim]正在分析...[/]", title),
+                    console=self.console,
+                    refresh_per_second=5,  # 降低刷新率避免闪烁
+                    transient=True
+                )
+                live.start()
+                initialized = True
+            
+            # 更新Live显示内容
+            if live:
+                try:
+                    panel = self.create_ai_panel(content + "[dim]▊[/]", title)
+                    live.update(panel)
+                except:
+                    pass  # 忽略更新错误，避免崩溃
         
         def finish():
-            nonlocal content
-            final_panel = self.create_ai_panel(content, title)
-            live.update(final_panel)
-            live.stop()
+            nonlocal content, live, initialized
+            # 清理Live显示
+            if live and initialized:
+                try:
+                    live.stop()
+                except:
+                    pass
+            
+            # 显示最终结果 - 确保干净显示
+            if content.strip():
+                # 清除可能残留的Live内容
+                self.console.print("\r", end="")  # 清除当前行
+                final_panel = self.create_ai_panel(content, title)
+                self.console.print(final_panel)
         
         callback.finish = finish
         return callback

@@ -37,18 +37,40 @@ class AIClient:
                            prompt: str,
                            max_tokens: Optional[int] = None,
                            temperature: Optional[float] = None,
+                           model_name: Optional[str] = None,
+                           image_base64: Optional[str] = None,
                            **kwargs) -> Dict[str, Any]:
-        """构建请求数据"""
+        """构建请求数据，支持视觉输入"""
+        
+        # 构建消息内容
+        if image_base64:
+            # 视觉模型请求格式
+            message_content = [
+                {
+                    "type": "text",
+                    "text": prompt
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{image_base64}"
+                    }
+                }
+            ]
+        else:
+            # 纯文本请求
+            message_content = prompt
+        
         data = {
-            "model": self.config.model_name,
-            "messages": [{"role": "user", "content": prompt}],
+            "model": model_name or self.config.model_name,
+            "messages": [{"role": "user", "content": message_content}],
             "temperature": temperature or self.config.temperature,
             "max_tokens": max_tokens or self.config.max_tokens,
             "stream": kwargs.get("stream", self.config.stream)  # 优先使用传入的stream参数
         }
 
         # 添加额外参数（排除已处理的参数）
-        extra_kwargs = {k: v for k, v in kwargs.items() if k not in ["stream"]}
+        extra_kwargs = {k: v for k, v in kwargs.items() if k not in ["stream", "model_name", "image_base64"]}
         data.update(extra_kwargs)
         
         return data
@@ -296,20 +318,26 @@ class AIClient:
     def chat_with_scenario(self,
                           prompt: str,
                           scenario: str = "chat",
-                          on_chunk: Optional[Callable[[str], None]] = None) -> str:
-        """根据场景配置进行对话"""
+                          on_chunk: Optional[Callable[[str], None]] = None,
+                          image_base64: Optional[str] = None) -> str:
+        """根据场景配置进行对话，支持视觉输入"""
         scenario_config = self.config.get_scenario_config(scenario)
 
         max_tokens = scenario_config.get("max_tokens", self.config.max_tokens)
         temperature = scenario_config.get("temperature", self.config.temperature)
         stream = scenario_config.get("stream", self.config.stream)
+        
+        # 如果是视觉场景，使用指定的视觉模型
+        model_name = scenario_config.get("model_name", self.config.model_name)
 
         if stream and on_chunk:
             # 流式模式，使用回调
-            return self.chat_stream(prompt, max_tokens, temperature, on_chunk)
+            return self.chat_stream(prompt, max_tokens, temperature, on_chunk, 
+                                  model_name=model_name, image_base64=image_base64)
         else:
             # 批量模式或无回调
-            return self.chat(prompt, max_tokens, temperature, stream)
+            return self.chat(prompt, max_tokens, temperature, stream, 
+                           model_name=model_name, image_base64=image_base64)
 
     def check_connection(self) -> bool:
         """检查API连接"""

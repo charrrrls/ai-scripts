@@ -1,0 +1,14 @@
+开始执行脚本...
+准备登录到: https://gaccode.com/api/login
+登录状态: 200
+登录响应内容: {"message":"Login successful.","token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjI3MjU3LCJlbWFpbCI6IjEyMjA5NzI1NzJAcXEuY29tIiwiaWF0IjoxNzU1NzY0NjIwLCJleHAiOjE3NTgzNTY2MjB9.uL_6BcsLX8DXGpieND2gCP_1qBLauGKQ-2UZVoCOGDw","user":{"id":27257,"email":"1220972572@qq.com"}}
+登录响应: {'message': 'Login successful.', 'token': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjI3MjU3LCJlbWFpbCI6IjEyMjA5NzI1NzJAcXEuY29tIiwiaWF0IjoxNzU1NzY0NjIwLCJleHAiOjE3NTgzNTY2MjB9.uL_6BcsLX8DXGpieND2gCP_1qBLauGKQ-2UZVoCOGDw', 'user': {'id': 27257, 'email': '1220972572@qq.com'}}
+使用 token: token
+余额接口状态: 200
+余额信息:
+{
+  "balance": 429,
+  "creditCap": 2000,
+  "refillRate": 0,
+  "lastRefill": "2025-08-21T03:19:44.032Z"
+}
